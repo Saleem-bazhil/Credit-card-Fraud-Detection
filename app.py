@@ -13,13 +13,16 @@ import joblib
 import warnings
 import io
 import base64
+import os
+import tempfile
+import time
 from datetime import datetime
+from pathlib import Path
 warnings.filterwarnings("ignore")
 
 # ML Libraries
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, 
     f1_score, confusion_matrix, roc_auc_score, roc_curve,
@@ -29,14 +32,17 @@ from imblearn.over_sampling import SMOTE
 from imblearn.under_sampling import RandomUnderSampler
 from collections import Counter
 
+# TensorFlow/Keras
 import tensorflow as tf
-from tensorflow.keras.models import Sequential, Model
+from tensorflow import keras
+from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import (
     Conv1D, MaxPooling1D, Flatten, Dense, Dropout, 
     Input, BatchNormalization, GlobalAveragePooling1D
 )
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.metrics import Precision, Recall, AUC
 
 # =========================================================
 # STREAMLIT CONFIG
@@ -153,6 +159,65 @@ if 'model_trained' not in st.session_state:
     st.session_state.model_trained = False
 if 'training_history' not in st.session_state:
     st.session_state.training_history = None
+if 'random_features' not in st.session_state:
+    st.session_state.random_features = None
+if 'random_amount' not in st.session_state:
+    st.session_state.random_amount = None
+if 'demo_batch' not in st.session_state:
+    st.session_state.demo_batch = None
+
+# =========================================================
+# DATASET GENERATOR
+# =========================================================
+def generate_realistic_dataset(n_samples=10000):
+    """Generate realistic credit card fraud dataset"""
+    np.random.seed(42)
+    
+    # Parameters
+    fraud_ratio = 0.002  # 0.2% fraud rate
+    n_features = 30
+    
+    # Generate base features
+    X = np.random.randn(n_samples, n_features)
+    
+    # Add correlations between features
+    X[:, 1] = 0.3 * X[:, 0] + 0.7 * np.random.randn(n_samples)
+    X[:, 2] = 0.2 * X[:, 0] + 0.8 * np.random.randn(n_samples)
+    X[:, 3] = 0.4 * X[:, 1] + 0.6 * np.random.randn(n_samples)
+    X[:, 4] = 0.5 * X[:, 0] + 0.5 * np.random.randn(n_samples)
+    X[:, 5] = 0.3 * X[:, 1] + 0.7 * np.random.randn(n_samples)
+    
+    # Generate fraud labels
+    fraud_mask = np.random.rand(n_samples) < fraud_ratio
+    
+    # Add fraud patterns to make them distinguishable
+    # Fraud transactions have different statistical properties
+    X[fraud_mask, 0] += np.random.uniform(2, 4, fraud_mask.sum())
+    X[fraud_mask, 1] += np.random.uniform(-4, -2, fraud_mask.sum())
+    X[fraud_mask, 4] += np.random.uniform(3, 5, fraud_mask.sum())
+    X[fraud_mask, 7] += np.random.uniform(-3, -1, fraud_mask.sum())
+    X[fraud_mask, 10] += np.random.uniform(2, 4, fraud_mask.sum())
+    X[fraud_mask, 14] += np.random.uniform(-5, -2, fraud_mask.sum())
+    
+    # Add amount column (fraud transactions tend to be larger)
+    amounts = np.random.exponential(100, n_samples)
+    amounts[fraud_mask] *= np.random.uniform(2, 10, fraud_mask.sum())
+    
+    # Create feature names
+    columns = [f'V{i}' for i in range(1, n_features + 1)]
+    
+    # Create DataFrame
+    df = pd.DataFrame(X, columns=columns)
+    df['Amount'] = amounts
+    df['Time'] = np.arange(n_samples)  # Sequential time
+    df['Class'] = fraud_mask.astype(int)
+    
+    # Add some noise and missing values
+    for col in np.random.choice(columns[:10], size=3, replace=False):
+        mask = np.random.rand(n_samples) < 0.01  # 1% missing
+        df.loc[mask, col] = np.nan
+    
+    return df
 
 # =========================================================
 # FRAUD DETECTION SYSTEM CLASS
@@ -171,9 +236,12 @@ class FraudDetectionSystem:
         self.history = None
         
     def load_data(self, file_path):
-        """Load data from CSV file"""
+        """Load data from CSV file or uploaded file object"""
         try:
-            self.df = pd.read_csv(file_path)
+            if hasattr(file_path, 'read'):  # If it's a file-like object
+                self.df = pd.read_csv(file_path)
+            else:  # If it's a file path string
+                self.df = pd.read_csv(file_path)
             
             # Auto-detect target column
             target_candidates = ['Class', 'Fraud', 'is_fraud', 'isFraud', 'fraud', 'label', 'target']
@@ -187,13 +255,6 @@ class FraudDetectionSystem:
                 st.error(f"❌ Could not find target column. Expected one of: {', '.join(target_candidates)}")
                 return False
             
-            # Check class distribution
-            class_counts = self.df[self.target_column].value_counts()
-            st.info(f"✅ Data loaded successfully!")
-            st.info(f"📊 Dataset shape: {self.df.shape}")
-            st.info(f"🎯 Target column: '{self.target_column}'")
-            st.info(f"📈 Class distribution:\n{class_counts.to_dict()}")
-            
             return True
             
         except Exception as e:
@@ -202,46 +263,21 @@ class FraudDetectionSystem:
     
     def generate_sample_data(self):
         """Generate realistic sample data for demonstration"""
-        np.random.seed(42)
-        n_samples = 10000
-        fraud_ratio = 0.002  # 0.2% fraud rate
-        
-        # Generate features (similar to real credit card data)
-        n_features = 30
-        X = np.random.randn(n_samples, n_features)
-        
-        # Add some correlation patterns
-        X[:, 1] = 0.3 * X[:, 0] + 0.7 * np.random.randn(n_samples)
-        X[:, 2] = 0.2 * X[:, 0] + 0.8 * np.random.randn(n_samples)
-        X[:, 3] = 0.4 * X[:, 1] + 0.6 * np.random.randn(n_samples)
-        
-        # Generate fraud mask
-        fraud_mask = np.random.rand(n_samples) < fraud_ratio
-        
-        # Add fraud patterns
-        X[fraud_mask, 0] += 2.5  # V1 higher for fraud
-        X[fraud_mask, 1] -= 1.8  # V2 lower for fraud
-        X[fraud_mask, 4] += 3.2  # V5 higher for fraud
-        X[fraud_mask, 7] -= 2.1  # V8 lower for fraud
-        
-        # Add amount column
-        amounts = np.random.exponential(100, n_samples)
-        amounts[fraud_mask] *= np.random.uniform(2, 5, fraud_mask.sum())
-        
-        # Create DataFrame
-        columns = [f'V{i}' for i in range(1, n_features + 1)]
-        self.df = pd.DataFrame(X, columns=columns)
-        self.df['Amount'] = amounts
-        self.df['Amount_Normalized'] = np.log1p(amounts)
-        self.df['Class'] = fraud_mask.astype(int)
-        self.target_column = 'Class'
-        
-        # Add some missing values for realism
-        for col in np.random.choice(columns, size=5, replace=False):
-            self.df.loc[np.random.choice(self.df.index, size=100), col] = np.nan
-        
-        st.success(f"✅ Generated {n_samples} sample transactions with {fraud_mask.sum()} fraud cases")
-        return True
+        try:
+            self.df = generate_realistic_dataset(10000)
+            self.target_column = 'Class'
+            
+            fraud_count = self.df['Class'].sum()
+            total_count = len(self.df)
+            fraud_rate = (fraud_count / total_count) * 100
+            
+            st.success(f"✅ Generated {total_count:,} sample transactions")
+            st.success(f"📊 {fraud_count:,} fraud cases ({fraud_rate:.2f}%)")
+            return True
+            
+        except Exception as e:
+            st.error(f"❌ Error generating sample data: {str(e)}")
+            return False
     
     def preprocess_data(self):
         """Preprocess the data for model training"""
@@ -273,38 +309,26 @@ class FraudDetectionSystem:
             self.X_train = self.scaler.fit_transform(self.X_train)
             self.X_test = self.scaler.transform(self.X_test)
             
-            # Handle class imbalance with safe SMOTE
+            # Handle class imbalance
             class_counts = Counter(self.y_train)
             fraud_count = class_counts.get(1, 0)
             
-            if fraud_count >= 5:  # SMOTE needs at least 5 samples
-                k_neighbors = min(5, fraud_count - 1)
-                
-                smote = SMOTE(
-                    sampling_strategy='auto',
-                    random_state=42,
-                    k_neighbors=k_neighbors
-                )
-                
+            if fraud_count >= 5:
+                # Use SMOTE for balancing
+                smote = SMOTE(random_state=42, k_neighbors=min(5, fraud_count - 1))
                 self.X_train, self.y_train = smote.fit_resample(self.X_train, self.y_train)
-                st.success(f"✅ Applied SMOTE: Balanced classes to {Counter(self.y_train)}")
+                st.success(f"✅ Applied SMOTE: Balanced to {Counter(self.y_train)}")
             else:
-                st.warning(f"⚠️ Not enough fraud samples ({fraud_count}) for SMOTE. Using original data.")
-                
-                # Apply RandomUnderSampler to balance
+                # Use RandomUnderSampler if not enough fraud samples
                 rus = RandomUnderSampler(random_state=42, sampling_strategy=0.5)
                 self.X_train, self.y_train = rus.fit_resample(self.X_train, self.y_train)
-                st.success(f"✅ Applied RandomUnderSampler: Balanced classes to {Counter(self.y_train)}")
+                st.success(f"✅ Applied RandomUnderSampler: Balanced to {Counter(self.y_train)}")
             
-            # Reshape for CNN (samples, timesteps, features)
+            # Reshape for CNN
             self.X_train_cnn = self.X_train.reshape(self.X_train.shape[0], self.X_train.shape[1], 1)
             self.X_test_cnn = self.X_test.reshape(self.X_test.shape[0], self.X_test.shape[1], 1)
             
             st.success("✅ Data preprocessing completed!")
-            st.info(f"📊 Training set: {self.X_train.shape[0]} samples")
-            st.info(f"📊 Test set: {self.X_test.shape[0]} samples")
-            st.info(f"🔢 Features: {self.X_train.shape[1]}")
-            
             return True
             
         except Exception as e:
@@ -312,11 +336,10 @@ class FraudDetectionSystem:
             return False
     
     def build_hybrid_model(self):
-        """Build hybrid CNN + Logistic Regression model"""
+        """Build hybrid CNN + Dense model"""
         try:
             input_shape = (self.X_train_cnn.shape[1], 1)
             
-            # CNN Feature Extractor
             model = Sequential([
                 Input(shape=input_shape),
                 Conv1D(filters=32, kernel_size=3, activation='relu', padding='same'),
@@ -334,7 +357,6 @@ class FraudDetectionSystem:
                 GlobalAveragePooling1D(),
                 Dropout(0.4),
                 
-                # Dense layers (acting as logistic regression)
                 Dense(64, activation='relu'),
                 BatchNormalization(),
                 Dropout(0.3),
@@ -343,7 +365,6 @@ class FraudDetectionSystem:
                 BatchNormalization(),
                 Dropout(0.2),
                 
-                # Output layer (sigmoid for binary classification)
                 Dense(1, activation='sigmoid')
             ])
             
@@ -351,12 +372,7 @@ class FraudDetectionSystem:
             model.compile(
                 optimizer=Adam(learning_rate=0.001),
                 loss='binary_crossentropy',
-                metrics=[
-                    'accuracy',
-                    tf.keras.metrics.Precision(name='precision'),
-                    tf.keras.metrics.Recall(name='recall'),
-                    tf.keras.metrics.AUC(name='auc')
-                ]
+                metrics=['accuracy', Precision(name='precision'), Recall(name='recall'), AUC(name='auc')]
             )
             
             self.hybrid_model = model
@@ -369,12 +385,14 @@ class FraudDetectionSystem:
     def train_model(self, epochs=30, batch_size=64):
         """Train the hybrid model"""
         try:
+            # Check if data is preprocessed
             if not hasattr(self, 'X_train_cnn') or self.X_train_cnn is None:
                 if not self.preprocess_data():
                     return None
             
             # Build model
-            self.build_hybrid_model()
+            if self.hybrid_model is None:
+                self.build_hybrid_model()
             
             # Callbacks
             callbacks = [
@@ -437,14 +455,10 @@ class FraudDetectionSystem:
             # ROC curve
             fpr, tpr, thresholds = roc_curve(self.y_test, y_pred_proba)
             
-            # Classification report
-            report = classification_report(self.y_test, y_pred, output_dict=True)
-            
             self.model_metrics = {
                 'metrics': metrics,
                 'confusion_matrix': cm,
                 'roc_curve': (fpr, tpr, thresholds),
-                'classification_report': report,
                 'predictions': {
                     'y_true': self.y_test,
                     'y_pred': y_pred,
@@ -461,13 +475,12 @@ class FraudDetectionSystem:
     def predict_single(self, features):
         """Predict fraud probability for a single transaction"""
         try:
-            if self.hybrid_model is None:
+            if self.hybrid_model is None or self.scaler is None:
                 return None, None
             
             # Ensure correct number of features
             if len(features) != len(self.feature_columns):
-                st.warning(f"Expected {len(self.feature_columns)} features, got {len(features)}")
-                # Pad with zeros if needed
+                # Pad or truncate if needed
                 if len(features) < len(self.feature_columns):
                     features = list(features) + [0] * (len(self.feature_columns) - len(features))
                 else:
@@ -480,7 +493,7 @@ class FraudDetectionSystem:
             features_cnn = features_scaled.reshape(1, features_scaled.shape[1], 1)
             
             # Make prediction
-            probability = self.hybrid_model.predict(features_cnn, verbose=0)[0][0]
+            probability = float(self.hybrid_model.predict(features_cnn, verbose=0)[0][0])
             prediction = 1 if probability > 0.5 else 0
             
             return prediction, probability
@@ -493,9 +506,8 @@ class FraudDetectionSystem:
         """Predict fraud probability for batch of transactions"""
         try:
             if self.hybrid_model is None:
-                return None
+                return None, None
             
-            # Prepare batch
             predictions = []
             probabilities = []
             
@@ -509,42 +521,46 @@ class FraudDetectionSystem:
             
         except Exception as e:
             st.error(f"❌ Error in batch prediction: {str(e)}")
-            return None
+            return None, None
     
     def save_model(self, filename='fraud_detection_model'):
         """Save the trained model and scaler"""
         try:
+            # Create directory if it doesn't exist
+            os.makedirs('saved_models', exist_ok=True)
+            
             # Save Keras model
-            self.hybrid_model.save(f'{filename}.h5')
+            model_path = f'saved_models/{filename}.h5'
+            self.hybrid_model.save(model_path)
             
             # Save scaler
-            joblib.dump(self.scaler, f'{filename}_scaler.pkl')
+            scaler_path = f'saved_models/{filename}_scaler.pkl'
+            joblib.dump(self.scaler, scaler_path)
             
             # Save feature columns
-            joblib.dump(self.feature_columns, f'{filename}_features.pkl')
+            features_path = f'saved_models/{filename}_features.pkl'
+            joblib.dump(self.feature_columns, features_path)
             
-            # Save metrics if available
-            if self.model_metrics:
-                pd.DataFrame([self.model_metrics['metrics']]).to_csv(f'{filename}_metrics.csv', index=False)
-            
-            st.success(f"✅ Model saved successfully as '{filename}.h5'")
+            st.success(f"✅ Model saved successfully!")
             return True
             
         except Exception as e:
             st.error(f"❌ Error saving model: {str(e)}")
             return False
     
-    def load_model(self, model_path, scaler_path, features_path):
+    def load_model(self, model_path, scaler_path=None, features_path=None):
         """Load a pre-trained model"""
         try:
             # Load Keras model
-            self.hybrid_model = tf.keras.models.load_model(model_path)
+            self.hybrid_model = load_model(model_path)
             
-            # Load scaler
-            self.scaler = joblib.load(scaler_path)
+            # Load scaler if provided
+            if scaler_path:
+                self.scaler = joblib.load(scaler_path)
             
-            # Load feature columns
-            self.feature_columns = joblib.load(features_path)
+            # Load feature columns if provided
+            if features_path:
+                self.feature_columns = joblib.load(features_path)
             
             st.success("✅ Model loaded successfully!")
             return True
@@ -580,18 +596,40 @@ def create_download_link(data, filename, text):
     href = f'<a href="data:file/csv;base64,{b64}" download="{filename}" style="display: inline-block; padding: 10px 20px; background: linear-gradient(135deg, #3B82F6 0%, #1E3A8A 100%); color: white; text-decoration: none; border-radius: 5px; font-weight: bold;">{text}</a>'
     return href
 
+def display_prediction_result(prediction, probability, amount):
+    """Display prediction result with visualizations"""
+    st.markdown("---")
+    
+    if prediction == 1:
+        st.markdown('<div class="fraud-alert">', unsafe_allow_html=True)
+        st.error("### ⚠️ FRAUD DETECTED")
+        st.write(f"**Fraud Probability:** {probability*100:.2f}%")
+        st.write(f"**Transaction Amount:** ${amount:.2f}")
+        st.write("**⚠️ Action Required:** Block transaction and notify cardholder")
+        st.markdown('</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="normal-transaction">', unsafe_allow_html=True)
+        st.success("### ✅ TRANSACTION SAFE")
+        st.write(f"**Fraud Probability:** {probability*100:.2f}%")
+        st.write(f"**Transaction Amount:** ${amount:.2f}")
+        st.write("**✅ Status:** Transaction appears normal")
+        st.markdown('</div>', unsafe_allow_html=True)
+
 # =========================================================
 # STREAMLIT UI COMPONENTS
 # =========================================================
 def display_sidebar():
     """Display sidebar with navigation and status"""
     with st.sidebar:
-        st.image("https://img.icons8.com/color/96/000000/security-checked.png", width=80)
-        st.title("Navigation")
+        st.markdown("""
+        <div style="text-align: center; margin-bottom: 20px;">
+            <span style="font-size: 48px;">💳</span>
+            <h3 style="margin: 5px 0;">Fraud Detection</h3>
+        </div>
+        """, unsafe_allow_html=True)
         
-        # Navigation menu
         page = st.radio(
-            "Go to:",
+            "Navigate to:",
             ["🏠 Home", "📊 Data Management", "🤖 Model Training", 
              "🔍 Predict Fraud", "📈 Results & Analysis", "💾 Save/Load Model"]
         )
@@ -601,68 +639,35 @@ def display_sidebar():
         
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Data", "✅" if st.session_state.data_loaded else "❌", 
-                     "Loaded" if st.session_state.data_loaded else "Required")
+            status = "✅" if st.session_state.data_loaded else "❌"
+            st.metric("Data", status, "Loaded" if st.session_state.data_loaded else "Required")
         with col2:
-            st.metric("Model", "✅" if st.session_state.model_trained else "❌",
-                     "Trained" if st.session_state.model_trained else "Not Trained")
+            status = "✅" if st.session_state.model_trained else "❌"
+            st.metric("Model", status, "Trained" if st.session_state.model_trained else "Not Trained")
         with col3:
             st.metric("System", "✅", "Ready")
         
         st.markdown("---")
         
-        # Quick actions
-        st.subheader("Quick Actions")
-        
         if st.button("🔄 Reset System", use_container_width=True):
-            st.session_state.clear()
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
             st.rerun()
-        
-        if st.button("📋 Generate Report", use_container_width=True):
-            st.info("Report generation feature coming soon!")
-        
-        # System info
-        st.markdown("---")
-        st.markdown("""
-        <div style="font-size: 0.8rem; color: #666;">
-        <p><strong>System Info:</strong></p>
-        <p>• Hybrid CNN + LR Model</p>
-        <p>• Safe SMOTE Balancing</p>
-        <p>• Real-time Detection</p>
-        <p>• Version: 1.0.0</p>
-        <p>• Year: 2025-2026</p>
-        </div>
-        """, unsafe_allow_html=True)
     
     return page
 
 def home_page():
     """Home page with overview"""
     st.markdown("<h1 class='main-title'>💳 Credit Card Fraud Detection System</h1>", unsafe_allow_html=True)
-    st.markdown("<h4 class='sub-title'>Hybrid CNN + Logistic Regression Model with Safe SMOTE Balancing</h4>", unsafe_allow_html=True)
+    st.markdown("<h4 class='sub-title'>Hybrid CNN + Dense Neural Network Model</h4>", unsafe_allow_html=True)
     
-    # Hero section
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.markdown("""
-        <div style="text-align: center; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    border-radius: 20px; margin: 20px 0;">
-            <h3 style="color: white; margin-bottom: 20px;">🔒 Advanced Fraud Protection</h3>
-            <p style="color: white; font-size: 1.1rem;">Detect fraudulent transactions with 97%+ accuracy</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    # Key features
-    st.markdown("---")
-    st.subheader("✨ Key Features")
-    
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     
     with col1:
         st.markdown("""
         <div class="metric-card">
             <h3>🎯 High Accuracy</h3>
-            <p>97%+ accuracy in fraud detection using hybrid AI model</p>
+            <p>Advanced deep learning model for fraud detection</p>
         </div>
         """, unsafe_allow_html=True)
     
@@ -670,113 +675,71 @@ def home_page():
         st.markdown("""
         <div class="metric-card">
             <h3>⚡ Real-time Detection</h3>
-            <p>Instant fraud detection for individual and batch transactions</p>
+            <p>Instant fraud detection for transactions</p>
         </div>
         """, unsafe_allow_html=True)
     
-    with col3:
-        st.markdown("""
-        <div class="metric-card">
-            <h3>📊 Comprehensive Analytics</h3>
-            <p>Detailed performance metrics and visualizations</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    # Getting started
     st.markdown("---")
-    st.subheader("🚀 Getting Started")
-    
-    steps = [
-        ("1. 📊 Load Data", "Upload your dataset or generate sample data"),
-        ("2. 🤖 Train Model", "Train the hybrid CNN + Logistic Regression model"),
-        ("3. 🔍 Predict Fraud", "Test transactions for fraud detection"),
-        ("4. 📈 Analyze Results", "View detailed performance metrics"),
-        ("5. 💾 Save Model", "Export your trained model for production")
-    ]
-    
-    for step_title, step_desc in steps:
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            st.success(step_title)
-        with col2:
-            st.write(step_desc)
-    
-    # Quick start buttons
-    st.markdown("---")
-    st.subheader("⚡ Quick Start")
+    st.subheader("🚀 Quick Start")
     
     col1, col2 = st.columns(2)
     
     with col1:
-        if st.button("📊 Load Sample Data", use_container_width=True):
+        if st.button("📊 Generate Sample Data", use_container_width=True):
             system = FraudDetectionSystem()
-            system.generate_sample_data()
-            st.session_state.fraud_system = system
-            st.session_state.data_loaded = True
-            st.success("✅ Sample data loaded successfully!")
-            st.rerun()
+            if system.generate_sample_data():
+                st.session_state.fraud_system = system
+                st.session_state.data_loaded = True
+                st.success("✅ Sample data generated successfully!")
+                st.rerun()
     
     with col2:
         if st.button("🎬 Quick Demo", use_container_width=True):
-            with st.spinner("Setting up complete demo..."):
+            with st.spinner("Setting up demo..."):
                 system = FraudDetectionSystem()
-                system.generate_sample_data()
-                system.preprocess_data()
-                system.train_model(epochs=15, batch_size=32)
-                st.session_state.fraud_system = system
-                st.session_state.data_loaded = True
-                st.session_state.model_trained = True
-            st.success("✅ Demo setup complete! Check other pages for results.")
-            st.rerun()
+                if system.generate_sample_data():
+                    system.preprocess_data()
+                    system.train_model(epochs=10, batch_size=32)
+                    st.session_state.fraud_system = system
+                    st.session_state.data_loaded = True
+                    st.session_state.model_trained = True
+                    st.success("✅ Demo setup complete!")
+                    st.rerun()
 
 def data_management_page():
     """Data management page"""
     st.subheader("📊 Data Management")
     
-    # Initialize system if needed
     if st.session_state.fraud_system is None:
         st.session_state.fraud_system = FraudDetectionSystem()
     
     system = st.session_state.fraud_system
     
-    # Data loading options
     col1, col2 = st.columns(2)
     
     with col1:
         st.markdown("### 📥 Upload Dataset")
-        uploaded_file = st.file_uploader(
-            "Choose a CSV file",
-            type=['csv'],
-            help="Upload your credit card transaction dataset"
-        )
+        uploaded_file = st.file_uploader("Choose a CSV file", type=['csv'])
         
         if uploaded_file is not None:
             if st.button("📂 Load Uploaded Data", use_container_width=True):
-                with st.spinner("Loading data..."):
-                    if system.load_data(uploaded_file):
-                        st.session_state.data_loaded = True
-                        st.success("✅ Data loaded successfully!")
-                        st.rerun()
+                if system.load_data(uploaded_file):
+                    st.session_state.data_loaded = True
+                    st.success("✅ Data loaded successfully!")
+                    st.rerun()
     
     with col2:
         st.markdown("### 🎲 Generate Sample Data")
-        st.markdown("Generate realistic credit card transaction data for testing")
-        
-        n_samples = st.slider("Number of transactions", 1000, 50000, 10000, 1000)
-        
-        if st.button("🔄 Generate Data", use_container_width=True):
-            with st.spinner(f"Generating {n_samples:,} transactions..."):
-                system.generate_sample_data()
+        if st.button("🔄 Generate Sample Data", use_container_width=True):
+            if system.generate_sample_data():
                 st.session_state.data_loaded = True
-                st.success(f"✅ Generated {n_samples:,} sample transactions!")
+                st.success("✅ Sample data generated!")
                 st.rerun()
     
-    # Display data if loaded
     if st.session_state.data_loaded and system.df is not None:
         st.markdown("---")
         st.subheader("📈 Data Overview")
         
-        # Basic statistics
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Total Transactions", f"{len(system.df):,}")
@@ -785,195 +748,85 @@ def data_management_page():
             st.metric("Fraud Cases", f"{fraud_count:,}")
         with col3:
             fraud_rate = (fraud_count / len(system.df)) * 100
-            st.metric("Fraud Rate", f"{fraud_rate:.4f}%")
+            st.metric("Fraud Rate", f"{fraud_rate:.2f}%")
         with col4:
             st.metric("Features", len(system.df.columns) - 1)
         
-        # Data preview tabs
-        tab1, tab2, tab3 = st.tabs(["📋 Data Preview", "📊 Statistics", "📈 Visualizations"])
+        tab1, tab2 = st.tabs(["📋 Data Preview", "📊 Statistics"])
         
         with tab1:
             st.dataframe(system.df.head(20), use_container_width=True)
-            
-            # Show data types
-            st.markdown("#### Data Types")
-            dtype_df = pd.DataFrame({
-                'Column': system.df.columns,
-                'Type': system.df.dtypes.values,
-                'Non-Null Count': system.df.notnull().sum().values,
-                'Null Count': system.df.isnull().sum().values
-            })
-            st.dataframe(dtype_df, use_container_width=True, hide_index=True)
         
         with tab2:
             st.dataframe(system.df.describe(), use_container_width=True)
-            
-            # Correlation with target
-            if system.target_column in system.df.columns:
-                numeric_cols = system.df.select_dtypes(include=[np.number]).columns
-                corr_with_target = system.df[numeric_cols].corr()[system.target_column].abs().sort_values(ascending=False)
-                
-                st.markdown("#### Correlation with Target")
-                st.dataframe(corr_with_target.reset_index().rename(columns={'index': 'Feature', system.target_column: 'Correlation'}), 
-                           use_container_width=True, hide_index=True)
         
-        with tab3:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Class distribution pie chart
-                class_counts = system.df[system.target_column].value_counts()
-                fig = px.pie(
-                    values=class_counts.values,
-                    names=['Normal', 'Fraud'],
-                    title='Class Distribution',
-                    hole=0.4,
-                    color_discrete_sequence=['#00CC00', '#FF4B4B']
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                # Amount distribution
-                if 'Amount' in system.df.columns:
-                    fig = px.histogram(
-                        system.df,
-                        x='Amount',
-                        color=system.target_column,
-                        nbins=50,
-                        title='Transaction Amount Distribution',
-                        color_discrete_map={0: '#00CC00', 1: '#FF4B4B'},
-                        log_y=True
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-            
-            # Feature distributions
-            st.markdown("#### Feature Distributions")
-            numeric_cols = system.df.select_dtypes(include=[np.number]).columns.tolist()
-            if system.target_column in numeric_cols:
-                numeric_cols.remove(system.target_column)
-            
-            if len(numeric_cols) > 0:
-                selected_feature = st.selectbox("Select feature to visualize", numeric_cols[:10])
-                
-                fig = px.histogram(
-                    system.df,
-                    x=selected_feature,
-                    color=system.target_column,
-                    nbins=50,
-                    title=f'Distribution of {selected_feature}',
-                    color_discrete_map={0: '#00CC00', 1: '#FF4B4B'},
-                    marginal="box"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-        
-        # Preprocess button
-        st.markdown("---")
-        if st.button("🔄 Preprocess Data for Training", type="primary", use_container_width=True):
-            with st.spinner("Preprocessing data..."):
+        if st.button("🔄 Preprocess Data", type="primary", use_container_width=True):
+            with st.spinner("Preprocessing..."):
                 if system.preprocess_data():
-                    st.success("✅ Data preprocessing completed successfully!")
-                    st.info("You can now proceed to Model Training")
+                    st.success("✅ Data preprocessing completed!")
+                    st.info("Proceed to Model Training")
 
 def model_training_page():
     """Model training page"""
     st.subheader("🤖 Model Training")
     
     if not st.session_state.data_loaded:
-        st.warning("⚠️ Please load data first from the Data Management page!")
+        st.warning("⚠️ Please load data first!")
         return
     
     system = st.session_state.fraud_system
     
-    # Training configuration
     st.markdown("### 🎯 Training Configuration")
     
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        epochs = st.slider("Number of Epochs", 10, 100, 30, 5,
-                          help="Number of complete passes through the training data")
+        epochs = st.slider("Epochs", 5, 50, 20, 5)
     
     with col2:
-        batch_size = st.selectbox("Batch Size", [16, 32, 64, 128, 256], index=2,
-                                 help="Number of samples per gradient update")
+        batch_size = st.selectbox("Batch Size", [16, 32, 64, 128], index=1)
     
     with col3:
         learning_rate = st.select_slider("Learning Rate", 
-                                        options=[0.1, 0.01, 0.001, 0.0001, 0.00001],
-                                        value=0.001,
-                                        help="Step size for optimizer")
+                                        options=[0.1, 0.01, 0.001, 0.0001],
+                                        value=0.001)
     
-    # Advanced options
-    with st.expander("⚙️ Advanced Options"):
-        col1, col2 = st.columns(2)
-        with col1:
-            validation_split = st.slider("Validation Split", 0.1, 0.4, 0.2, 0.05)
-        with col2:
-            early_stopping = st.checkbox("Early Stopping", value=True)
-    
-    # Start training button
     if st.button("🚀 Start Training", type="primary", use_container_width=True):
-        with st.spinner("Training in progress... This may take a few minutes"):
+        with st.spinner("Training in progress..."):
             progress_bar = st.progress(0)
-            status_text = st.empty()
             
-            # Training steps
-            steps = [
-                ("Preprocessing data...", 10),
-                ("Building model architecture...", 30),
-                ("Training CNN feature extractor...", 50),
-                ("Training logistic regression layer...", 70),
-                ("Evaluating model performance...", 90),
-                ("Training completed!", 100)
-            ]
+            for i in range(100):
+                progress_bar.progress(i + 1)
+                time.sleep(0.02)
             
-            for step_text, step_progress in steps:
-                status_text.text(step_text)
-                progress_bar.progress(step_progress)
-                # Simulate time for each step
-                import time
-                time.sleep(0.5)
-            
-            # Train model
             history = system.train_model(epochs=epochs, batch_size=batch_size)
             
             if history:
                 st.session_state.training_history = history
                 st.session_state.model_trained = True
-                
                 st.balloons()
                 st.success("🎉 Model trained successfully!")
             else:
                 st.error("❌ Model training failed!")
     
-    # Show training results if model is trained
     if st.session_state.model_trained and system.model_metrics:
         st.markdown("---")
         st.subheader("📊 Training Results")
         
         metrics = system.model_metrics['metrics']
         
-        # Display metrics in cards
         col1, col2, col3, col4, col5 = st.columns(5)
         
-        metric_config = [
-            ("Accuracy", metrics['Accuracy'], "#3B82F6", "Overall correctness"),
-            ("Precision", metrics['Precision'], "#10B981", "Fraud detection accuracy"),
-            ("Recall", metrics['Recall'], "#F59E0B", "Fraud coverage"),
-            ("F1 Score", metrics['F1 Score'], "#EF4444", "Balance metric"),
-            ("ROC AUC", metrics['ROC AUC'], "#8B5CF6", "Discrimination ability")
-        ]
-        
-        for idx, (name, value, color, desc) in enumerate(metric_config):
-            with [col1, col2, col3, col4, col5][idx]:
-                st.markdown(f"""
-                <div style="text-align: center; padding: 15px; background-color: {color}15; 
-                            border-radius: 10px; border-left: 4px solid {color}; margin: 5px;">
-                    <h3 style="color: {color}; margin: 0; font-size: 1.5rem;">{value:.3%}</h3>
-                    <p style="margin: 5px 0 0 0; font-weight: 600; color: #333;">{name}</p>
-                    <p style="margin: 2px 0 0 0; font-size: 0.8rem; color: #666;">{desc}</p>
-                </div>
-                """, unsafe_allow_html=True)
+        with col1:
+            st.metric("Accuracy", f"{metrics['Accuracy']:.3%}")
+        with col2:
+            st.metric("Precision", f"{metrics['Precision']:.3%}")
+        with col3:
+            st.metric("Recall", f"{metrics['Recall']:.3%}")
+        with col4:
+            st.metric("F1 Score", f"{metrics['F1 Score']:.3%}")
+        with col5:
+            st.metric("ROC AUC", f"{metrics['ROC AUC']:.3%}")
         
         # Confusion Matrix
         st.markdown("#### 📊 Confusion Matrix")
@@ -983,84 +836,28 @@ def model_training_page():
             cm,
             text_auto=True,
             title="Confusion Matrix",
-            labels=dict(x="Predicted", y="Actual", color="Count"),
+            labels=dict(x="Predicted", y="Actual"),
             x=['Normal', 'Fraud'],
             y=['Normal', 'Fraud'],
-            color_continuous_scale='Blues',
-            aspect='auto'
-        )
-        fig.update_xaxes(side="top")
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # ROC Curve
-        st.markdown("#### 📈 ROC Curve")
-        fpr, tpr, thresholds = system.model_metrics['roc_curve']
-        
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=fpr, y=tpr,
-            mode='lines',
-            name=f'ROC Curve (AUC = {metrics["ROC AUC"]:.3f})',
-            line=dict(color='blue', width=3),
-            fill='tozeroy',
-            fillcolor='rgba(0, 100, 255, 0.2)'
-        ))
-        fig.add_trace(go.Scatter(
-            x=[0, 1], y=[0, 1],
-            mode='lines',
-            name='Random Classifier',
-            line=dict(dash='dash', color='red', width=2)
-        ))
-        fig.update_layout(
-            title='Receiver Operating Characteristic (ROC) Curve',
-            xaxis_title='False Positive Rate',
-            yaxis_title='True Positive Rate',
-            hovermode='x unified',
-            showlegend=True,
-            height=400
+            color_continuous_scale='Blues'
         )
         st.plotly_chart(fig, use_container_width=True)
-        
-        # Training history if available
-        if st.session_state.training_history:
-            st.markdown("#### 📈 Training History")
-            
-            history_df = pd.DataFrame(st.session_state.training_history.history)
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                fig = px.line(
-                    history_df[['loss', 'val_loss']],
-                    title='Training & Validation Loss',
-                    labels={'value': 'Loss', 'index': 'Epoch'}
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                fig = px.line(
-                    history_df[['accuracy', 'val_accuracy']],
-                    title='Training & Validation Accuracy',
-                    labels={'value': 'Accuracy', 'index': 'Epoch'}
-                )
-                st.plotly_chart(fig, use_container_width=True)
 
 def predict_fraud_page():
     """Fraud prediction page"""
     st.subheader("🔍 Fraud Detection")
     
     if not st.session_state.model_trained:
-        st.warning("⚠️ Please train the model first from the Model Training page!")
+        st.warning("⚠️ Please train the model first!")
         return
     
     system = st.session_state.fraud_system
     
-    # Create tabs for different prediction modes
     tab1, tab2 = st.tabs(["🔍 Single Transaction", "📁 Batch Processing"])
     
     with tab1:
         st.markdown("### Test Individual Transaction")
         
-        # Two input modes
         input_mode = st.radio("Input Mode", ["🎲 Random Sample", "✍️ Manual Input"], horizontal=True)
         
         if input_mode == "🎲 Random Sample":
@@ -1069,535 +866,138 @@ def predict_fraud_page():
                 if st.button("🎲 Generate Random Transaction", use_container_width=True):
                     if system.feature_columns:
                         features = generate_sample_features(len(system.feature_columns))
-                        amount = np.random.exponential(100)  # Random amount
+                        amount = np.random.exponential(100)
                         
-                        # Store in session state
                         st.session_state.random_features = features
                         st.session_state.random_amount = amount
                         
-                        # Display generated features
-                        with st.expander("📋 Generated Features", expanded=True):
-                            # Show first 10 features
+                        with st.expander("📋 Generated Features"):
                             for i in range(min(10, len(features))):
                                 st.write(f"**Feature {i+1}:** {features[i]:.4f}")
-                            
-                            if len(features) > 10:
-                                st.caption(f"... and {len(features)-10} more features")
-                            
-                            st.metric("Transaction Amount", f"${amount:.2f}")
+                            st.metric("Amount", f"${amount:.2f}")
             
-            # Predict button for random transaction
             if 'random_features' in st.session_state:
                 if st.button("🔍 Predict Fraud", type="primary", use_container_width=True):
-                    with st.spinner("Analyzing transaction..."):
-                        prediction, probability = system.predict_single(st.session_state.random_features)
-                        
-                        if prediction is not None:
-                            display_prediction_result(prediction, probability, st.session_state.random_amount)
+                    prediction, probability = system.predict_single(st.session_state.random_features)
+                    if prediction is not None:
+                        display_prediction_result(prediction, probability, st.session_state.random_amount)
         
-        else:  # Manual Input
+        else:
             st.markdown("#### Enter Transaction Details")
             
             if system.feature_columns:
-                # Create input fields for key features
                 with st.form("transaction_form"):
-                    st.markdown("##### Key Transaction Features")
-                    
-                    # Display first 12 features for manual input
                     feature_inputs = []
-                    cols_per_row = 4
                     
-                    for i in range(min(12, len(system.feature_columns))):
-                        if i % cols_per_row == 0:
-                            cols = st.columns(cols_per_row)
-                        
-                        with cols[i % cols_per_row]:
-                            feature_name = system.feature_columns[i]
-                            value = st.number_input(
-                                feature_name,
-                                value=0.0,
-                                format="%.4f",
-                                key=f"feature_{i}"
-                            )
+                    for i in range(min(10, len(system.feature_columns))):
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            feature_name = f"V{i+1}"
+                            value = st.number_input(feature_name, value=0.0, format="%.4f", key=f"feat_{i}")
                             feature_inputs.append(value)
                     
-                    # Fill remaining features with zeros
                     if len(feature_inputs) < len(system.feature_columns):
                         feature_inputs.extend([0.0] * (len(system.feature_columns) - len(feature_inputs)))
                     
-                    # Transaction amount
-                    st.markdown("##### Transaction Information")
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        amount = st.number_input(
-                            "💵 Transaction Amount ($)", 
-                            min_value=0.01, 
-                            max_value=10000.0, 
-                            value=100.0, 
-                            step=10.0,
-                            format="%.2f"
-                        )
+                    amount = st.number_input("💵 Amount ($)", value=100.0, format="%.2f")
                     
-                    with col2:
-                        time_delta = st.number_input(
-                            "⏰ Time Since First Transaction", 
-                            min_value=0, 
-                            max_value=1000000, 
-                            value=50000
-                        )
-                    
-                    # Submit button
-                    submitted = st.form_submit_button("🔍 Predict Fraud Risk", type="primary", use_container_width=True)
+                    submitted = st.form_submit_button("🔍 Predict", type="primary", use_container_width=True)
                     
                     if submitted:
-                        with st.spinner("Analyzing transaction patterns..."):
-                            prediction, probability = system.predict_single(feature_inputs)
-                            
-                            if prediction is not None:
-                                display_prediction_result(prediction, probability, amount)
+                        prediction, probability = system.predict_single(feature_inputs)
+                        if prediction is not None:
+                            display_prediction_result(prediction, probability, amount)
     
     with tab2:
         st.markdown("### Process Multiple Transactions")
         
-        # Options for batch processing
-        batch_mode = st.radio("Batch Mode", ["📊 Generate Demo Data", "📁 Upload CSV File"], horizontal=True)
+        n_samples = st.slider("Number of demo transactions", 10, 100, 50)
         
-        if batch_mode == "📊 Generate Demo Data":
-            st.markdown("Generate a demo dataset for testing batch processing")
+        if st.button("📊 Generate Demo Batch", use_container_width=True):
+            demo_features = []
+            for _ in range(n_samples):
+                features = generate_sample_features(len(system.feature_columns))
+                demo_features.append(features)
             
-            n_samples = st.slider("Number of transactions", 10, 1000, 100, 10)
-            
-            if st.button("📊 Generate Demo Dataset", use_container_width=True):
-                with st.spinner(f"Generating {n_samples} demo transactions..."):
-                    # Create demo features
-                    demo_features = []
-                    for _ in range(n_samples):
-                        features = generate_sample_features(len(system.feature_columns))
-                        demo_features.append(features)
+            st.session_state.demo_batch = demo_features
+            st.success(f"✅ Generated {n_samples} demo transactions!")
+        
+        if 'demo_batch' in st.session_state:
+            if st.button("🔍 Process Batch", type="primary", use_container_width=True):
+                demo_features = st.session_state.demo_batch
+                predictions, probabilities = system.predict_batch(demo_features)
+                
+                if predictions:
+                    results_df = pd.DataFrame({
+                        'Transaction_ID': range(len(predictions)),
+                        'Prediction': ['Fraud' if p == 1 else 'Normal' for p in predictions],
+                        'Probability': probabilities
+                    })
                     
-                    # Store in session state
-                    st.session_state.demo_batch = demo_features
-                    st.success(f"✅ Generated {n_samples} demo transactions!")
-            
-            # Process demo batch
-            if 'demo_batch' in st.session_state:
-                if st.button("🔍 Process Demo Batch", type="primary", use_container_width=True):
-                    with st.spinner("Processing batch transactions..."):
-                        demo_features = st.session_state.demo_batch
-                        predictions, probabilities = system.predict_batch(demo_features)
-                        
-                        if predictions:
-                            # Create results dataframe
-                            results_df = pd.DataFrame({
-                                'Transaction_ID': range(len(predictions)),
-                                'Prediction': ['Fraud' if p == 1 else 'Normal' for p in predictions],
-                                'Fraud_Probability': probabilities,
-                                'Risk_Level': ['High' if prob > 0.7 else 'Medium' if prob > 0.3 else 'Low' for prob in probabilities]
-                            })
-                            
-                            display_batch_results(results_df)
-        
-        else:  # Upload CSV File
-            st.markdown("Upload a CSV file containing transaction features")
-            
-            uploaded_file = st.file_uploader(
-                "Choose CSV file", 
-                type=['csv'],
-                help="File should contain transaction features (same as training data)"
-            )
-            
-            if uploaded_file is not None:
-                try:
-                    batch_df = pd.read_csv(uploaded_file)
-                    st.success(f"✅ Loaded {len(batch_df)} transactions")
+                    st.dataframe(results_df, use_container_width=True)
                     
-                    # Show preview
-                    with st.expander("📋 Preview Data"):
-                        st.dataframe(batch_df.head(20), use_container_width=True)
-                    
-                    # Check if we have required features
-                    if st.button("🔍 Process Uploaded Batch", type="primary", use_container_width=True):
-                        with st.spinner("Processing transactions..."):
-                            # Prepare features
-                            batch_features = []
-                            for _, row in batch_df.iterrows():
-                                features = []
-                                for col in system.feature_columns:
-                                    if col in row:
-                                        features.append(row[col])
-                                    else:
-                                        features.append(0.0)
-                                batch_features.append(features)
-                            
-                            # Make predictions
-                            predictions, probabilities = system.predict_batch(batch_features)
-                            
-                            if predictions:
-                                # Create results dataframe
-                                results_df = pd.DataFrame({
-                                    'Transaction_ID': range(len(predictions)),
-                                    'Prediction': ['Fraud' if p == 1 else 'Normal' for p in predictions],
-                                    'Fraud_Probability': probabilities,
-                                    'Risk_Level': ['High' if prob > 0.7 else 'Medium' if prob > 0.3 else 'Low' for prob in probabilities]
-                                })
-                                
-                                display_batch_results(results_df)
-                                
-                except Exception as e:
-                    st.error(f"❌ Error processing file: {str(e)}")
-
-def display_prediction_result(prediction, probability, amount):
-    """Display prediction result with visualizations"""
-    st.markdown("---")
-    
-    # Display result
-    if prediction == 1:
-        st.markdown('<div class="fraud-alert">', unsafe_allow_html=True)
-        
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            st.markdown("""
-            <div style="text-align: center;">
-                <span style="font-size: 4rem;">🚨</span>
-                <h3 style="color: #FF4B4B; margin: 10px 0;">HIGH RISK</h3>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col2:
-            st.error("### ⚠️ FRAUD DETECTED")
-            st.write(f"**Fraud Probability:** {probability*100:.2f}%")
-            st.write(f"**Transaction Amount:** ${amount:.2f}")
-            st.write("**⚠️ Action Required:** Block transaction and notify cardholder immediately")
-            st.write("**🔒 Recommended:** Flag account for review")
-        
-        st.markdown('</div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="normal-transaction">', unsafe_allow_html=True)
-        
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            st.markdown("""
-            <div style="text-align: center;">
-                <span style="font-size: 4rem;">✅</span>
-                <h3 style="color: #00CC00; margin: 10px 0;">LOW RISK</h3>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col2:
-            st.success("### ✅ TRANSACTION SAFE")
-            st.write(f"**Fraud Probability:** {probability*100:.2f}%")
-            st.write(f"**Transaction Amount:** ${amount:.2f}")
-            st.write("**✅ Status:** Transaction appears normal")
-            st.write("**👍 Recommendation:** Approve transaction")
-        
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    # Risk gauge
-    st.markdown("#### 📊 Risk Assessment Gauge")
-    
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number+delta",
-        value=probability * 100,
-        title={'text': "Fraud Risk Score", 'font': {'size': 24}},
-        delta={'reference': 50},
-        gauge={
-            'axis': {'range': [None, 100], 'tickwidth': 1, 'tickcolor': "darkblue"},
-            'bar': {'color': "darkblue"},
-            'bgcolor': "white",
-            'borderwidth': 2,
-            'bordercolor': "gray",
-            'steps': [
-                {'range': [0, 20], 'color': "green"},
-                {'range': [20, 50], 'color': "lightgreen"},
-                {'range': [50, 70], 'color': "yellow"},
-                {'range': [70, 90], 'color': "orange"},
-                {'range': [90, 100], 'color': "red"}
-            ],
-            'threshold': {
-                'line': {'color': "red", 'width': 4},
-                'thickness': 0.75,
-                'value': 70
-            }
-        }
-    ))
-    
-    fig.update_layout(height=300)
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Explanation
-    with st.expander("📋 Analysis Details"):
-        st.markdown("##### Risk Classification:")
-        if probability < 0.2:
-            st.success("**Very Low Risk** - Highly likely to be legitimate")
-        elif probability < 0.5:
-            st.info("**Low Risk** - Probably legitimate")
-        elif probability < 0.7:
-            st.warning("**Medium Risk** - Requires monitoring")
-        elif probability < 0.9:
-            st.error("**High Risk** - Likely fraudulent")
-        else:
-            st.error("**Very High Risk** - Almost certainly fraudulent")
-
-def display_batch_results(results_df):
-    """Display batch prediction results"""
-    st.markdown("---")
-    st.subheader("📋 Batch Processing Results")
-    
-    # Summary statistics
-    fraud_count = (results_df['Prediction'] == 'Fraud').sum()
-    total_count = len(results_df)
-    fraud_rate = (fraud_count / total_count) * 100
-    
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total Processed", total_count)
-    with col2:
-        st.metric("Fraud Detected", fraud_count)
-    with col3:
-        st.metric("Fraud Rate", f"{fraud_rate:.2f}%")
-    with col4:
-        avg_prob = results_df['Fraud_Probability'].mean() * 100
-        st.metric("Avg Risk Score", f"{avg_prob:.2f}%")
-    
-    # Display results table
-    st.markdown("#### Detailed Results")
-    st.dataframe(results_df, use_container_width=True)
-    
-    # Visualizations
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Prediction distribution
-        fig = px.pie(
-            results_df, 
-            names='Prediction',
-            title='Prediction Distribution',
-            color='Prediction',
-            color_discrete_map={'Fraud': '#FF4B4B', 'Normal': '#00CC00'},
-            hole=0.4
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        # Risk level distribution
-        fig = px.bar(
-            results_df['Risk_Level'].value_counts().reset_index(),
-            x='index',
-            y='Risk_Level',
-            title='Risk Level Distribution',
-            labels={'index': 'Risk Level', 'Risk_Level': 'Count'},
-            color='index',
-            color_discrete_map={'High': '#FF4B4B', 'Medium': '#FFC107', 'Low': '#00CC00'}
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # Download results
-    st.markdown("#### 💾 Export Results")
-    csv = results_df.to_csv(index=False)
-    st.markdown(create_download_link(csv, "fraud_detection_results.csv", "📥 Download Results"), unsafe_allow_html=True)
+                    fraud_count = sum(predictions)
+                    st.metric("Fraud Detected", fraud_count, f"{fraud_count/len(predictions)*100:.1f}%")
 
 def results_analysis_page():
     """Results and analysis page"""
     st.subheader("📈 Results & Analysis")
     
     if not st.session_state.model_trained:
-        st.info("ℹ️ No results available. Please train the model first!")
+        st.info("ℹ️ Train the model first to see results!")
         return
     
     system = st.session_state.fraud_system
     
     if system.model_metrics is None:
-        st.error("❌ Model metrics not available. Please retrain the model.")
+        st.error("❌ No metrics available. Please retrain the model.")
         return
     
     metrics = system.model_metrics['metrics']
-    cm = system.model_metrics['confusion_matrix']
     
-    # Performance dashboard
     st.markdown("### 📊 Performance Dashboard")
     
-    # Top metrics
     col1, col2, col3, col4, col5 = st.columns(5)
     
-    metric_display = [
-        ("Accuracy", metrics['Accuracy'], "#3B82F6"),
-        ("Precision", metrics['Precision'], "#10B981"),
-        ("Recall", metrics['Recall'], "#F59E0B"),
-        ("F1 Score", metrics['F1 Score'], "#EF4444"),
-        ("ROC AUC", metrics['ROC AUC'], "#8B5CF6")
-    ]
+    with col1:
+        st.metric("Accuracy", f"{metrics['Accuracy']:.3%}")
+    with col2:
+        st.metric("Precision", f"{metrics['Precision']:.3%}")
+    with col3:
+        st.metric("Recall", f"{metrics['Recall']:.3%}")
+    with col4:
+        st.metric("F1 Score", f"{metrics['F1 Score']:.3%}")
+    with col5:
+        st.metric("ROC AUC", f"{metrics['ROC AUC']:.3%}")
     
-    for idx, (name, value, color) in enumerate(metric_display):
-        with [col1, col2, col3, col4, col5][idx]:
-            st.markdown(f"""
-            <div style="text-align: center; padding: 15px; background: linear-gradient(135deg, {color}20, {color}40);
-                        border-radius: 10px; border-left: 4px solid {color}; margin: 5px;">
-                <h3 style="color: {color}; margin: 0; font-size: 1.8rem;">{value:.3%}</h3>
-                <p style="margin: 5px 0 0 0; font-weight: 600; color: #333;">{name}</p>
-            </div>
-            """, unsafe_allow_html=True)
-    
-    # Detailed analysis tabs
-    st.markdown("---")
-    tab1, tab2, tab3 = st.tabs(["📈 Detailed Metrics", "📊 Confusion Analysis", "🎯 ROC Analysis"])
+    tab1, tab2 = st.tabs(["📊 Confusion Matrix", "📈 ROC Curve"])
     
     with tab1:
-        st.markdown("#### 📈 Detailed Performance Metrics")
-        
-        # Create metrics dataframe
-        metrics_df = pd.DataFrame({
-            'Metric': list(metrics.keys()),
-            'Value': [f"{v:.3%}" if isinstance(v, float) else str(v) for v in metrics.values()]
-        })
-        
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.dataframe(metrics_df, use_container_width=True, hide_index=True)
-        
-        with col2:
-            # Performance rating
-            accuracy = metrics['Accuracy']
-            if accuracy >= 0.95:
-                rating = "Excellent"
-                color = "green"
-            elif accuracy >= 0.90:
-                rating = "Very Good"
-                color = "lightgreen"
-            elif accuracy >= 0.85:
-                rating = "Good"
-                color = "orange"
-            else:
-                rating = "Needs Improvement"
-                color = "red"
-            
-            st.markdown(f"""
-            <div style="text-align: center; padding: 20px; background-color: {color}20; 
-                        border-radius: 10px; border: 2px solid {color}; margin: 10px 0;">
-                <h3 style="color: {color}; margin: 0;">{rating}</h3>
-                <p style="margin: 5px 0 0 0; color: #666;">Performance Rating</p>
-            </div>
-            """, unsafe_allow_html=True)
+        cm = system.model_metrics['confusion_matrix']
+        fig = px.imshow(cm, text_auto=True, title="Confusion Matrix",
+                       labels=dict(x="Predicted", y="Actual"),
+                       x=['Normal', 'Fraud'], y=['Normal', 'Fraud'],
+                       color_continuous_scale='Blues')
+        st.plotly_chart(fig, use_container_width=True)
     
     with tab2:
-        st.markdown("#### 📊 Confusion Matrix Analysis")
-        
-        # Display confusion matrix
-        fig = px.imshow(
-            cm,
-            text_auto=True,
-            title="Confusion Matrix",
-            labels=dict(x="Predicted", y="Actual", color="Count"),
-            x=['Normal', 'Fraud'],
-            y=['Normal', 'Fraud'],
-            color_continuous_scale='Blues',
-            aspect='auto'
-        )
-        fig.update_xaxes(side="top")
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Calculate detailed metrics
-        tn, fp, fn, tp = cm.ravel()
-        
-        st.markdown("##### 📈 Confusion Matrix Metrics")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("True Negatives", tn)
-        with col2:
-            st.metric("False Positives", fp)
-        with col3:
-            st.metric("False Negatives", fn)
-        with col4:
-            st.metric("True Positives", tp)
-    
-    with tab3:
-        st.markdown("#### 🎯 ROC Curve Analysis")
-        
-        fpr, tpr, thresholds = system.model_metrics['roc_curve']
-        
-        # ROC Curve
+        fpr, tpr, _ = system.model_metrics['roc_curve']
         fig = go.Figure()
-        
-        fig.add_trace(go.Scatter(
-            x=fpr, y=tpr,
-            mode='lines',
-            name=f'ROC Curve (AUC = {metrics["ROC AUC"]:.3f})',
-            line=dict(color='blue', width=3),
-            fill='tozeroy',
-            fillcolor='rgba(0, 100, 255, 0.2)'
-        ))
-        
-        fig.add_trace(go.Scatter(
-            x=[0, 1], y=[0, 1],
-            mode='lines',
-            name='Random Classifier',
-            line=dict(dash='dash', color='red', width=2)
-        ))
-        
-        fig.update_layout(
-            title='Receiver Operating Characteristic (ROC) Curve',
-            xaxis_title='False Positive Rate',
-            yaxis_title='True Positive Rate',
-            hovermode='x unified',
-            showlegend=True,
-            height=500
-        )
-        
+        fig.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', 
+                                name=f'ROC Curve (AUC = {metrics["ROC AUC"]:.3f})',
+                                line=dict(color='blue', width=3)))
+        fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode='lines',
+                                name='Random', line=dict(dash='dash', color='red')))
+        fig.update_layout(title='ROC Curve', xaxis_title='False Positive Rate',
+                         yaxis_title='True Positive Rate')
         st.plotly_chart(fig, use_container_width=True)
-        
-        # AUC Interpretation
-        auc_score = metrics['ROC AUC']
-        
-        if auc_score >= 0.9:
-            interpretation = "Excellent discrimination"
-            color = "green"
-        elif auc_score >= 0.8:
-            interpretation = "Good discrimination"
-            color = "lightgreen"
-        elif auc_score >= 0.7:
-            interpretation = "Fair discrimination"
-            color = "orange"
-        else:
-            interpretation = "Poor discrimination"
-            color = "red"
-        
-        st.markdown(f"""
-        <div style="padding: 20px; background-color: {color}15; border-radius: 10px; 
-                    border-left: 4px solid {color}; margin: 20px 0;">
-            <h4 style="color: {color}; margin: 0 0 10px 0;">📊 AUC Score Interpretation</h4>
-            <p style="margin: 5px 0; font-size: 1.1rem;">
-                <strong>AUC Score:</strong> {auc_score:.3f}<br>
-                <strong>Interpretation:</strong> {interpretation}
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    # Export section
-    st.markdown("---")
-    st.markdown("#### 💾 Export Results")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Export metrics
-        metrics_df = pd.DataFrame([metrics])
-        csv = metrics_df.to_csv(index=False)
-        st.markdown(create_download_link(csv, "model_metrics.csv", "📊 Download Metrics"), unsafe_allow_html=True)
-    
-    with col2:
-        # Export confusion matrix
-        cm_df = pd.DataFrame(cm, columns=['Predicted_Normal', 'Predicted_Fraud'], 
-                           index=['Actual_Normal', 'Actual_Fraud'])
-        cm_csv = cm_df.to_csv()
-        st.markdown(create_download_link(cm_csv, "confusion_matrix.csv", "📈 Download Confusion Matrix"), unsafe_allow_html=True)
 
 def save_load_model_page():
     """Model save/load page"""
     st.subheader("💾 Save/Load Model")
     
     if st.session_state.fraud_system is None:
-        st.warning("⚠️ No system initialized. Please load data first.")
+        st.warning("⚠️ Initialize system first!")
         return
     
     system = st.session_state.fraud_system
@@ -1608,62 +1008,37 @@ def save_load_model_page():
         st.markdown("### 💾 Save Model")
         
         if not st.session_state.model_trained:
-            st.info("ℹ️ Please train a model first before saving.")
+            st.info("ℹ️ Train a model first!")
         else:
-            model_name = st.text_input("Model Name", value="fraud_detection_model")
+            model_name = st.text_input("Model Name", value="fraud_model")
             
             if st.button("💾 Save Model", use_container_width=True):
-                with st.spinner("Saving model..."):
-                    if system.save_model(model_name):
-                        st.success(f"✅ Model saved as '{model_name}.h5'")
-                        
-                        # Provide download links
-                        files = [f'{model_name}.h5', f'{model_name}_scaler.pkl', f'{model_name}_features.pkl']
-                        for file in files:
-                            try:
-                                with open(file, 'rb') as f:
-                                    bytes = f.read()
-                                    b64 = base64.b64encode(bytes).decode()
-                                    href = f'<a href="data:file/octet-stream;base64,{b64}" download="{file}" style="display: inline-block; padding: 10px 20px; background: linear-gradient(135deg, #3B82F6 0%, #1E3A8A 100%); color: white; text-decoration: none; border-radius: 5px; font-weight: bold; margin: 5px;">📥 Download {file}</a>'
-                                    st.markdown(href, unsafe_allow_html=True)
-                            except:
-                                st.warning(f"Could not create download link for {file}")
+                if system.save_model(model_name):
+                    st.success("✅ Model saved!")
+                    
+                    # Create download links
+                    if os.path.exists(f'saved_models/{model_name}.h5'):
+                        with open(f'saved_models/{model_name}.h5', 'rb') as f:
+                            bytes_data = f.read()
+                            b64 = base64.b64encode(bytes_data).decode()
+                            href = f'<a href="data:file/octet-stream;base64,{b64}" download="{model_name}.h5">📥 Download Model</a>'
+                            st.markdown(href, unsafe_allow_html=True)
     
     with col2:
         st.markdown("### 📂 Load Model")
         
-        uploaded_model = st.file_uploader("Upload Model File (.h5)", type=['h5'])
-        uploaded_scaler = st.file_uploader("Upload Scaler File (.pkl)", type=['pkl'])
-        uploaded_features = st.file_uploader("Upload Features File (.pkl)", type=['pkl'])
+        uploaded_model = st.file_uploader("Upload Model (.h5)", type=['h5'])
         
-        if uploaded_model and uploaded_scaler and uploaded_features:
+        if uploaded_model is not None:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.h5') as tmp:
+                tmp.write(uploaded_model.getvalue())
+                tmp_path = tmp.name
+            
             if st.button("📂 Load Model", use_container_width=True):
-                with st.spinner("Loading model..."):
-                    # Save uploaded files temporarily
-                    import tempfile
-                    
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.h5') as tmp_model:
-                        tmp_model.write(uploaded_model.getvalue())
-                        model_path = tmp_model.name
-                    
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl') as tmp_scaler:
-                        tmp_scaler.write(uploaded_scaler.getvalue())
-                        scaler_path = tmp_scaler.name
-                    
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl') as tmp_features:
-                        tmp_features.write(uploaded_features.getvalue())
-                        features_path = tmp_features.name
-                    
-                    # Load model
-                    if system.load_model(model_path, scaler_path, features_path):
-                        st.session_state.model_trained = True
-                        st.success("✅ Model loaded successfully!")
-                        
-                        # Clean up temp files
-                        import os
-                        os.unlink(model_path)
-                        os.unlink(scaler_path)
-                        os.unlink(features_path)
+                if system.load_model(tmp_path):
+                    st.session_state.model_trained = True
+                    st.success("✅ Model loaded!")
+                    os.unlink(tmp_path)
 
 # =========================================================
 # MAIN APP
@@ -1671,10 +1046,8 @@ def save_load_model_page():
 def main():
     """Main application function"""
     
-    # Display sidebar
     page = display_sidebar()
     
-    # Route to selected page
     if page == "🏠 Home":
         home_page()
     elif page == "📊 Data Management":
@@ -1692,9 +1065,4 @@ def main():
 # RUN THE APP
 # =========================================================
 if __name__ == "__main__":
-    # Add Font Awesome for icons
-    st.markdown("""
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    """, unsafe_allow_html=True)
-    
     main()
