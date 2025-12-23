@@ -46,9 +46,6 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.metrics import Precision, Recall, AUC
 
-# =========================================================
-# STREAMLIT CONFIG
-# =========================================================
 st.set_page_config(
     page_title="Cyber Fraud AI",
     page_icon="💳",
@@ -617,9 +614,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# =========================================================
-# SESSION STATE INITIALIZATION
-# =========================================================
 if 'fraud_system' not in st.session_state:
     st.session_state.fraud_system = None
 if 'data_loaded' not in st.session_state:
@@ -637,9 +631,7 @@ if 'demo_batch' not in st.session_state:
 if 'current_page' not in st.session_state:
     st.session_state.current_page = "Home"
 
-# =========================================================
-# DATASET GENERATOR
-# =========================================================
+# data set generation
 def generate_realistic_dataset(n_samples=10000):
     """Generate realistic credit card fraud dataset"""
     np.random.seed(42)
@@ -684,9 +676,7 @@ def generate_realistic_dataset(n_samples=10000):
     
     return df
 
-# =========================================================
-# FRAUD DETECTION SYSTEM CLASS
-# =========================================================
+# fraud detection system
 class FraudDetectionSystem:
     def __init__(self):
         self.df = None
@@ -716,13 +706,13 @@ class FraudDetectionSystem:
                     break
             
             if self.target_column not in self.df.columns:
-                st.error(f"❌ Could not find target column. Expected one of: {', '.join(target_candidates)}")
+                st.error(f" Could not find target column. Expected one of: {', '.join(target_candidates)}")
                 return False
             
             return True
             
         except Exception as e:
-            st.error(f"❌ Error loading data: {str(e)}")
+            st.error(f" Error loading data: {str(e)}")
             return False
     
     def generate_sample_data(self):
@@ -735,19 +725,19 @@ class FraudDetectionSystem:
             total_count = len(self.df)
             fraud_rate = (fraud_count / total_count) * 100
             
-            st.success(f"✅ Generated {total_count:,} sample transactions")
+            st.success(f" Generated {total_count:,} sample transactions")
             st.success(f"📊 {fraud_count:,} fraud cases ({fraud_rate:.2f}%)")
             return True
             
         except Exception as e:
-            st.error(f"❌ Error generating sample data: {str(e)}")
+            st.error(f" Error generating sample data: {str(e)}")
             return False
     
     def preprocess_data(self):
         """Preprocess the data for model training"""
         try:
             if self.df is None:
-                st.error("❌ No data loaded!")
+                st.error(" No data loaded!")
                 return False
             
             df_clean = self.df.copy()
@@ -773,20 +763,20 @@ class FraudDetectionSystem:
             if fraud_count >= 5:
                 smote = SMOTE(random_state=42, k_neighbors=min(5, fraud_count - 1))
                 self.X_train, self.y_train = smote.fit_resample(self.X_train, self.y_train)
-                st.success(f"✅ Applied SMOTE: Balanced to {Counter(self.y_train)}")
+                st.success(f" Applied SMOTE: Balanced to {Counter(self.y_train)}")
             else:
                 rus = RandomUnderSampler(random_state=42, sampling_strategy=0.5)
                 self.X_train, self.y_train = rus.fit_resample(self.X_train, self.y_train)
-                st.success(f"✅ Applied RandomUnderSampler: Balanced to {Counter(self.y_train)}")
+                st.success(f" Applied RandomUnderSampler: Balanced to {Counter(self.y_train)}")
             
             self.X_train_cnn = self.X_train.reshape(self.X_train.shape[0], self.X_train.shape[1], 1)
             self.X_test_cnn = self.X_test.reshape(self.X_test.shape[0], self.X_test.shape[1], 1)
             
-            st.success("✅ Data preprocessing completed!")
+            st.success(" Data preprocessing completed!")
             return True
             
         except Exception as e:
-            st.error(f"❌ Error in preprocessing: {str(e)}")
+            st.error(f" Error in preprocessing: {str(e)}")
             return False
     
     def build_hybrid_model(self):
@@ -832,7 +822,7 @@ class FraudDetectionSystem:
             return model
             
         except Exception as e:
-            st.error(f"❌ Error building model: {str(e)}")
+            st.error(f" Error building model: {str(e)}")
             return None
     
     def train_model(self, epochs=30, batch_size=64):
@@ -875,7 +865,7 @@ class FraudDetectionSystem:
             return self.history
             
         except Exception as e:
-            st.error(f"❌ Error training model: {str(e)}")
+            st.error(f" Error training model: {str(e)}")
             return None
     
     def evaluate_model(self):
@@ -912,7 +902,7 @@ class FraudDetectionSystem:
             return self.model_metrics
             
         except Exception as e:
-            st.error(f"❌ Error evaluating model: {str(e)}")
+            st.error(f" Error evaluating model: {str(e)}")
             return None
     
     def predict_single(self, features):
@@ -936,7 +926,7 @@ class FraudDetectionSystem:
             return prediction, probability
             
         except Exception as e:
-            st.error(f"❌ Error in prediction: {str(e)}")
+            st.error(f" Error in prediction: {str(e)}")
             return None, None
     
     def predict_batch(self, batch_data):
@@ -957,7 +947,7 @@ class FraudDetectionSystem:
             return predictions, probabilities
             
         except Exception as e:
-            st.error(f"❌ Error in batch prediction: {str(e)}")
+            st.error(f" Error in batch prediction: {str(e)}")
             return None, None
     
     def save_model(self, filename='fraud_detection_model'):
@@ -974,11 +964,11 @@ class FraudDetectionSystem:
             features_path = f'saved_models/{filename}_features.pkl'
             joblib.dump(self.feature_columns, features_path)
             
-            st.success(f"✅ Model saved successfully!")
+            st.success(f" Model saved successfully!")
             return True
             
         except Exception as e:
-            st.error(f"❌ Error saving model: {str(e)}")
+            st.error(f" Error saving model: {str(e)}")
             return False
     
     def load_model(self, model_path, scaler_path=None, features_path=None):
@@ -992,16 +982,13 @@ class FraudDetectionSystem:
             if features_path:
                 self.feature_columns = joblib.load(features_path)
             
-            st.success("✅ Model loaded successfully!")
+            st.success(" Model loaded successfully!")
             return True
             
         except Exception as e:
-            st.error(f"❌ Error loading model: {str(e)}")
+            st.error(f" Error loading model: {str(e)}")
             return False
 
-# =========================================================
-# HELPER FUNCTIONS
-# =========================================================
 def generate_sample_features(n_features):
     """Generate random features for demo"""
     features = []
@@ -1041,9 +1028,7 @@ def display_prediction_result(prediction, probability, amount):
         st.write("**✅ Status:** Transaction appears normal")
         st.markdown('</div>', unsafe_allow_html=True)
 
-# =========================================================
-# ENHANCED VISUALIZATION FUNCTIONS
-# =========================================================
+# visualization functions
 
 def create_comprehensive_metrics_dashboard(metrics_dict):
     """Create a comprehensive metrics dashboard with clear visualizations"""
@@ -1563,10 +1548,10 @@ def display_sidebar():
         
         col1, col2 = st.columns(2)
         with col1:
-            status = "✅ Active" if st.session_state.data_loaded else "❌ Inactive"
+            status = " Active" if st.session_state.data_loaded else "❌ Inactive"
             st.metric("Data", status)
         with col2:
-            status = "✅ Active" if st.session_state.model_trained else "❌ Inactive"
+            status = " Active" if st.session_state.model_trained else "❌ Inactive"
             st.metric("Model", status)
         
         st.markdown("---")
@@ -1695,7 +1680,7 @@ def home_page():
             if system.generate_sample_data():
                 st.session_state.fraud_system = system
                 st.session_state.data_loaded = True
-                st.success("✅ Sample data generated!")
+                st.success(" Sample data generated!")
                 st.rerun()
     
     with col2:
@@ -1708,7 +1693,7 @@ def home_page():
                     st.session_state.fraud_system = system
                     st.session_state.data_loaded = True
                     st.session_state.model_trained = True
-                    st.success("✅ Demo setup complete!")
+                    st.success(" Demo setup complete!")
                     st.balloons()
                     st.rerun()
 
@@ -1739,7 +1724,7 @@ def data_management_page():
             if st.button("Load Data", use_container_width=True):
                 if system.load_data(uploaded_file):
                     st.session_state.data_loaded = True
-                    st.success("✅ Data loaded successfully!")
+                    st.success(" Data loaded successfully!")
                     st.rerun()
     
     with col2:
@@ -1780,7 +1765,7 @@ def data_management_page():
         if st.button("🔄 Preprocess Data", type="primary", use_container_width=True):
             with st.spinner("Preprocessing data..."):
                 if system.preprocess_data():
-                    st.success("✅ Data preprocessing completed!")
+                    st.success(" Data preprocessing completed!")
                     st.info("Proceed to Model Training")
 
 def model_training_page():
@@ -1830,9 +1815,9 @@ def model_training_page():
                 st.session_state.training_history = history
                 st.session_state.model_trained = True
                 st.balloons()
-                st.success("🎉 Model trained successfully!")
+                st.success(" Model trained successfully!")
             else:
-                st.error("❌ Model training failed!")
+                st.error(" Model training failed!")
     
     if st.session_state.model_trained and system.model_metrics:
         st.markdown("---")
@@ -1956,7 +1941,7 @@ def predict_fraud_page():
                 demo_features.append(features)
             
             st.session_state.demo_batch = demo_features
-            st.success(f"✅ Generated {n_samples} demo transactions!")
+            st.success(f" Generated {n_samples} demo transactions!")
         
         if 'demo_batch' in st.session_state:
             if st.button("Process Batch", type="primary", use_container_width=True):
@@ -1985,13 +1970,13 @@ def results_analysis_page():
     """, unsafe_allow_html=True)
     
     if not st.session_state.model_trained:
-        st.info("ℹ️ Train the model first to see results!")
+        st.info("ℹ Train the model first to see results!")
         return
     
     system = st.session_state.fraud_system
     
     if system.model_metrics is None:
-        st.error("❌ No metrics available. Please retrain the model.")
+        st.error(" No metrics available. Please retrain the model.")
         return
     
     metrics = system.model_metrics['metrics']
@@ -2264,9 +2249,7 @@ def save_load_model_page():
                     st.success("✅ Model loaded!")
                     os.unlink(tmp_path)
 
-# =========================================================
-# MAIN APP
-# =========================================================
+# main app
 def main():
     """Main application function"""
     
@@ -2285,8 +2268,5 @@ def main():
     elif page == "System":
         save_load_model_page()
 
-# =========================================================
-# RUN THE APP
-# =========================================================
 if __name__ == "__main__":
     main()
